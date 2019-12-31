@@ -1,14 +1,12 @@
-﻿using System.Net;
+﻿using Unity.Burst;
 using UnityEngine;
 using Unity.Networking.Transport;
 using Unity.Collections;
 using Unity.Jobs;
-using NetworkConnection = Unity.Networking.Transport.NetworkConnection;
-using UdpCNetworkDriver = Unity.Networking.Transport.BasicNetworkDriver<Unity.Networking.Transport.IPv4UDPSocket>;
 
 public class PingServerBehaviour : MonoBehaviour
 {
-    public UdpCNetworkDriver m_ServerDriver;
+    public UdpNetworkDriver m_ServerDriver;
     private NativeList<NetworkConnection> m_connections;
 
     private JobHandle m_updateHandle;
@@ -16,19 +14,16 @@ public class PingServerBehaviour : MonoBehaviour
     void Start()
     {
         ushort serverPort = 9000;
-        ushort newPort = 0;
-        if (CommandLine.TryGetCommandLineArgValue("+server.port", out newPort))
-            serverPort = newPort;
         // Create the server driver, bind it to a port and start listening for incoming connections
-        m_ServerDriver = new UdpCNetworkDriver(new INetworkParameter[0]);
-        if (m_ServerDriver.Bind(new IPEndPoint(IPAddress.Any, serverPort)) != 0)
+        m_ServerDriver = new UdpNetworkDriver(new INetworkParameter[0]);
+        var addr = NetworkEndPoint.AnyIpv4;
+        addr.Port = serverPort;
+        if (m_ServerDriver.Bind(addr) != 0)
             Debug.Log($"Failed to bind to port {serverPort}");
         else
             m_ServerDriver.Listen();
 
         m_connections = new NativeList<NetworkConnection>(16, Allocator.Persistent);
-
-        SQPDriver.ServerPort = serverPort;
     }
 
     void OnDestroy()
@@ -39,9 +34,10 @@ public class PingServerBehaviour : MonoBehaviour
         m_connections.Dispose();
     }
 
+    [BurstCompile]
     struct DriverUpdateJob : IJob
     {
-        public UdpCNetworkDriver driver;
+        public UdpNetworkDriver driver;
         public NativeList<NetworkConnection> connections;
 
         public void Execute()
@@ -69,7 +65,7 @@ public class PingServerBehaviour : MonoBehaviour
         }
     }
 
-    static NetworkConnection ProcessSingleConnection(UdpCNetworkDriver.Concurrent driver, NetworkConnection connection)
+    static NetworkConnection ProcessSingleConnection(UdpNetworkDriver.Concurrent driver, NetworkConnection connection)
     {
         DataStreamReader strm;
         NetworkEvent.Type cmd;
@@ -87,8 +83,7 @@ public class PingServerBehaviour : MonoBehaviour
                 var pongData = new DataStreamWriter(4, Allocator.Temp);
                 pongData.Write(id);
                 // Send the pong message with the same id as the ping
-                driver.Send(connection, pongData);
-                pongData.Dispose();
+                driver.Send(NetworkPipeline.Null, connection, pongData);
             }
             else if (cmd == NetworkEvent.Type.Disconnect)
             {
@@ -101,9 +96,10 @@ public class PingServerBehaviour : MonoBehaviour
         return connection;
     }
 #if ENABLE_IL2CPP
+    [BurstCompile]
     struct PongJob : IJob
     {
-        public UdpCNetworkDriver.Concurrent driver;
+        public UdpNetworkDriver.Concurrent driver;
         public NativeList<NetworkConnection> connections;
 
         public void Execute()
@@ -113,9 +109,10 @@ public class PingServerBehaviour : MonoBehaviour
         }
     }
 #else
-    struct PongJob : IJobParallelFor
+    [BurstCompile]
+    struct PongJob : IJobParallelForDefer
     {
-        public UdpCNetworkDriver.Concurrent driver;
+        public UdpNetworkDriver.Concurrent driver;
         public NativeArray<NetworkConnection> connections;
 
         public void Execute(int i)
@@ -137,21 +134,18 @@ public class PingServerBehaviour : MonoBehaviour
         // Wait for the previous frames ping to complete before starting a new one, the Complete in LateUpdate is not
         // enough since we can get multiple FixedUpdate per frame on slow clients
         m_updateHandle.Complete();
-        // If there is at least one client connected update the activity so the server is not shutdown
-        if (m_connections.Length > 0)
-            DedicatedServerConfig.UpdateLastActivity();
         var updateJob = new DriverUpdateJob {driver = m_ServerDriver, connections = m_connections};
         var pongJob = new PongJob
         {
             // PongJob is a ParallelFor job, it must use the concurrent NetworkDriver
             driver = m_ServerDriver.ToConcurrent(),
-            // PongJob uses IJobParallelForDeferExtensions, we *must* use ToDeferredJobArray in order to access the
+            // PongJob uses IJobParallelForDeferExtensions, we *must* use AsDeferredJobArray in order to access the
             // list from the job
 #if ENABLE_IL2CPP
             // IJobParallelForDeferExtensions is not working correctly with IL2CPP
             connections = m_connections
 #else
-            connections = m_connections.ToDeferredJobArray()
+            connections = m_connections.AsDeferredJobArray()
 #endif
         };
         // Update the driver should be the first job in the chain
